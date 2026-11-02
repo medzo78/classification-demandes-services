@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+data/train_*.txt
+data/test_*.txt
+*.egg-info/
+*.log
