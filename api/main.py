@@ -2,12 +2,12 @@
 API de classification des demandes de services (texte libre -> service / sous-service).
 
 Lance les deux modeles FastText entraines par train_model.py et expose un
-endpoint de prediction. Documentation interactive auto-generee par FastAPI
-sur /docs (utilisable directement depuis un navigateur, sans ecrire de code).
+endpoint de prediction, une interface web (/) et une documentation interactive
+auto-generee par FastAPI (/docs).
 
 Usage:
     uvicorn api.main:app --reload --port 8000
-Puis ouvrir http://127.0.0.1:8000/docs
+Puis ouvrir http://127.0.0.1:8000/ (interface) ou /docs (API)
 """
 import csv
 import os
@@ -34,11 +34,14 @@ np.array = _tolerant_array
 
 import fasttext  # noqa: E402  (doit etre importe apres le monkeypatch ci-dessus)
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 TAXONOMY_PATH = os.path.join(BASE_DIR, "data", "taxonomy.csv")
+STATIC_DIR = os.path.join(BASE_DIR, "static")
 
 app = FastAPI(
     title="Classification des demandes de services",
@@ -50,8 +53,11 @@ app = FastAPI(
     version="1.0.0",
 )
 
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
 _models = {}
 _service_to_sous = defaultdict(set)
+_sous_to_service = {}
 
 
 def _label_to_text(label: str) -> str:
@@ -73,6 +79,12 @@ def load_models():
         with open(TAXONOMY_PATH, encoding="utf-8") as f:
             for row in csv.DictReader(f):
                 _service_to_sous[row["service"]].add(row["sous_service"])
+                _sous_to_service[row["sous_service"]] = row["service"]
+
+
+@app.get("/", include_in_schema=False)
+def index():
+    return FileResponse(os.path.join(STATIC_DIR, "index.html"))
 
 
 class PredictRequest(BaseModel):
@@ -96,13 +108,31 @@ class PredictResponse(BaseModel):
     sous_service: List[Prediction]
 
 
-def _predict(name: str, text: str, k: int) -> List[Prediction]:
-    model = _models[name]
+def _predict_sous_service(text: str, k: int) -> List[Prediction]:
+    model = _models["sous_service"]
     labels, probs = model.predict(text.replace("\n", " "), k=k)
     return [
         Prediction(label=_label_to_text(label), confidence=round(float(p), 4))
         for label, p in zip(labels, probs)
     ]
+
+
+def _service_from_sous_service(sous_preds: List[Prediction], k: int) -> List[Prediction]:
+    """Derive le service depuis le sous-service predit (parent dans la taxonomie),
+    plutot que d'interroger le modele service independant : les deux modeles sont
+    entraines separement et peuvent se contredire (ex: sous-service "facade
+    exterieure" rattache a "Peinture", mais modele service predisant "Serrurerie").
+    Remonter par la hierarchie garantit un resultat coherent entre les deux niveaux.
+    """
+    best_per_service = {}
+    for pred in sous_preds:
+        service = _sous_to_service.get(pred.label)
+        if service is None:
+            continue
+        if service not in best_per_service or pred.confidence > best_per_service[service]:
+            best_per_service[service] = pred.confidence
+    ranked = sorted(best_per_service.items(), key=lambda kv: kv[1], reverse=True)
+    return [Prediction(label=label, confidence=conf) for label, conf in ranked[:k]]
 
 
 @app.get("/health")
@@ -124,8 +154,11 @@ def list_sous_services(service: str):
 
 @app.post("/predict", response_model=PredictResponse)
 def predict(req: PredictRequest):
+    # on echantillonne davantage de sous-services que necessaire pour avoir assez
+    # de matiere pour en deriver top_k services distincts
+    sous_preds_wide = _predict_sous_service(req.description, max(req.top_k * 5, 15))
     return PredictResponse(
         description=req.description,
-        service=_predict("service", req.description, req.top_k),
-        sous_service=_predict("sous_service", req.description, req.top_k),
+        service=_service_from_sous_service(sous_preds_wide, req.top_k),
+        sous_service=sous_preds_wide[: req.top_k],
     )
